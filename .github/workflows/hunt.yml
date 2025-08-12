@@ -28,7 +28,8 @@ jobs:
 
       - name: Run hunt
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+            DISCORD_WEBHOOK_URL_MAIN: ${{ secrets.DISCORD_WEBHOOK_URL_MAIN }}
+            DISCORD_WEBHOOK_URL_MAYBE: ${{ secrets.DISCORD_WEBHOOK_URL_MAYBE }}
           # 任意: 監視対象の上書き（JSON文字列）— 例をSecretsに入れて有効化してください
           # TARGETS_JSON: ${{ secrets.TARGETS_JSON }}
         run: |
