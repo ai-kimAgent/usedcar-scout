@@ -27,7 +27,7 @@ jobs:
       - name: Run hunt
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # 任意: 監視対象の上書き（JSON文字列）。必要なら下のコメントを外してSecretsを用意
+          # 任意: 監視対象の上書き（JSON文字列）— 例をSecretsに入れて有効化してください
           # TARGETS_JSON: ${{ secrets.TARGETS_JSON }}
         run: |
           python src/hunt.py
