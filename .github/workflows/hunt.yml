@@ -1,11 +1,12 @@
 name: Used Car Scout (Discord)
 
 on:
-  workflow_dispatch: {}
   schedule:
-    # GitHub Actions の cron は UTC（例: 0 0 → JST 09:00 / 0 12 → JST 21:00）
-    - cron: '0 0 * * *'
-    - cron: '0 12 * * *'
+    - cron: "0 21 * * *"   # JST 06:00
+    - cron: "0 3 * * *"    # JST 12:00
+    - cron: "0 9 * * *"    # JST 18:00
+    - cron: "0 12 * * *"   # JST 21:00
+    - cron: "25 14 * * *"  # JST 23:25
 
 jobs:
   run:
