@@ -8,11 +8,21 @@ Used-Car Scout（Discord通知版 / SUV監視・ハスラー除外 / ルール +
     * お得度 = p50 - 実売価格 でスコア/緊急度を後押し
     * 実売価格 ≤ p20 なら強い割安としてさらにブースト
 - SUVのみ拾うための include_keywords / 除外 exclude_keywords（デフォで「ハスラー/HUSTLER」は常時除外）
-- 緊急度4以上だけ Discord に通知。上位を results.csv に保存
+- 上位を results.csv に保存
+- Discord通知は二段構え：
+    * 🚀 即買いレベル … MAIN チャンネルへ（既定：緊急度≧4）
+    * 🤔 ありかもレベル … MAYBE チャンネルへ（既定：緊急度=3 または スコア70〜84.9）
 
 環境変数:
-  DISCORD_WEBHOOK_URL  … Discord Incoming Webhook URL（必須/通知）
-  TARGETS_JSON         … 監視ターゲット上書き（任意のJSON文字列）
+  DISCORD_WEBHOOK_URL_MAIN  … 即買いレベルの通知先（必須推奨）
+  DISCORD_WEBHOOK_URL_MAYBE … ありかもレベルの通知先（任意）
+  DISCORD_WEBHOOK_URL       … 旧単一Webhook名（MAINが未設定の時のフォールバック）
+  TARGETS_JSON              … 監視ターゲット上書き（任意のJSON文字列）
+  DISCORD_DRY_RUN           … "1" なら通知せず、送信内容をコンソールに出力（テスト用）
+
+  IMMEDIATE_URGENCY_MIN     … 即買いレベルの緊急度しきい値（デフォルト "4"）
+  MAYBE_SCORE_MIN           … ありかもレベルのスコア下限（デフォルト "70"）
+  MAYBE_SCORE_MAX           … ありかもレベルのスコア上限（デフォルト "84.9"）
 """
 from __future__ import annotations
 import os, re, csv, json, time, math
@@ -27,13 +37,24 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import KFold
 
+# --------- 通信設定 ---------
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 HEADERS = {"User-Agent": UA, "Accept-Language": "ja,en;q=0.9"}
 
-# --- SUV監視ターゲット（必要に応じて TARGETS_JSON で上書き推奨） ---
+# --------- 二段階通知のしきい値（環境変数で上書き可） ---------
+IMMEDIATE_URGENCY_MIN = int(os.getenv("IMMEDIATE_URGENCY_MIN", "4"))   # 即買い: 緊急度≧4
+MAYBE_SCORE_MIN = float(os.getenv("MAYBE_SCORE_MIN", "70"))            # ありかも: スコア下限
+MAYBE_SCORE_MAX = float(os.getenv("MAYBE_SCORE_MAX", "84.9"))          # ありかも: 上限(即買い未満)
+
+# Webhook（MAINは旧DISCORD_WEBHOOK_URLをフォールバック）
+WEBHOOK_MAIN  = os.getenv("DISCORD_WEBHOOK_URL_MAIN") or os.getenv("DISCORD_WEBHOOK_URL")
+WEBHOOK_MAYBE = os.getenv("DISCORD_WEBHOOK_URL_MAYBE")
+DRY_RUN = os.getenv("DISCORD_DRY_RUN", "0") == "1"
+
+# --------- SUV監視ターゲット（必要に応じて TARGETS_JSON で上書き推奨） ---------
 # include_keywords は SUVモデル名をざっくり網羅（表記ゆれは正規化で吸収）
 DEFAULT_TARGETS = [
     {
@@ -118,7 +139,7 @@ DEFAULT_TARGETS = [
     }
 ]
 
-# --- 正規表現ヘルパ ---
+# --------- 正規表現ヘルパ ---------
 _price_ja = re.compile(r"([0-9,.]+)\s*万円|([0-9,]+)\s*円")
 _km_ja    = re.compile(r"([0-9.]+)\s*万?km")
 _year_ja  = re.compile(r"(\d{4})年")
@@ -147,14 +168,14 @@ def year_from_text(val: str) -> int:
         return 0
     return int(m.group(1))
 
-# --- polite fetch ---
+# --------- polite fetch ---------
 def fetch(url: str) -> str:
-    time.sleep(1.2)  # 負荷配慮
+    time.sleep(1.2)  # 負荷配慮（必要に応じてランダム化してもOK）
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     return r.text
 
-# --- サイト別パーサ ---
+# --------- サイト別パーサ ---------
 def parse_carsensor_list(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "lxml")
     items: List[Dict[str, Any]] = []
@@ -213,7 +234,7 @@ SITE_PARSERS = {
     "goonet":    parse_goonet_list,
 }
 
-# --- タイトル正規化 & キーワードフィルタ（SUVだけ/ハスラー除外） ---
+# --------- タイトル正規化 & キーワードフィルタ（SUVだけ/ハスラー除外） ---------
 def _norm(s: str) -> str:
     return normalize("NFKC", (s or "")).upper()  # 全角→半角/記号正規化＋大文字化
 
@@ -231,7 +252,7 @@ def keyword_filter(items, include_keywords=None, exclude_keywords=None):
         out.append(it)
     return out
 
-# --- 相場/判定（ルール） ---
+# --------- 相場/判定（ルール） ---------
 def _percentile(sorted_list, p: float):
     if not sorted_list:
         return None
@@ -248,7 +269,7 @@ def compute_price_stats(items):
     s = sorted(prices)
     return {"median": _percentile(s, 0.5), "q25": _percentile(s, 0.25)}
 
-# --- 分位回帰 OOF: p50 / p20 予測 ---
+# --------- 分位回帰 OOF: p50 / p20 予測 ---------
 def _feat(it: Dict[str, Any]):
     title = (it.get("title") or "")
     return [
@@ -316,164 +337,4 @@ def assess_deal(it, stats, cfg):
         elif gap > 300_000:
             score = min(100, score + 5)
     if isinstance(pred20, (int, float)) and pred20 > 0 and price <= pred20:
-        score = min(100, score + 5)
-
-    # 緊急度（1-5）
-    if score >= 90:   urgency = 5
-    elif score >= 80: urgency = 4
-    elif score >= 70: urgency = 3
-    elif score >= 60: urgency = 2
-    else:             urgency = 1
-    if price_ratio <= 0.6:
-        urgency = min(5, urgency + 1)
-    if gap is not None and gap > 500_000:
-        urgency = min(5, urgency + 1)
-
-    # 相場不明フォールバック（中央値が無い回）
-    if not median:
-        if (price and price <= 0.8 * cfg.get("price_max", 9e9)
-            and year and year >= cfg.get("year_min", 0) + 2
-            and km and km <= 0.7 * cfg.get("mileage_max", 9e9)):
-            urgency = max(urgency, 4)
-            score   = max(score, 80)
-
-    it["price_ratio"] = round(price_ratio, 2)
-    it["score"]       = score
-    it["urgency"]     = int(urgency)
-    it["deal_gap"]    = int(gap) if gap is not None else None
-
-# --- Discord通知 ---
-def discord_notify(items: List[Dict[str, Any]]):
-    url = os.getenv("DISCORD_WEBHOOK_URL")
-    if not url:
-        print("[INFO] DISCORD_WEBHOOK_URL 未設定。Discord通知をスキップ")
-        return
-    cands = [x for x in items if x.get("urgency", 1) >= 4][:5]
-    if not cands:
-        print("[INFO] Discord通知対象なし（L4+なし）")
-        return
-    embeds = []
-    for it in cands:
-        price = f"{it.get('price',0):,}円" if it.get('price') else "—"
-        year  = it.get("year") or "—"
-        km    = it.get("mileage") or 0
-        km_s  = f"{km:,}km" if km else "—"
-        gap   = it.get("deal_gap")
-        gap_s = (f"+{gap:,}円" if isinstance(gap, int) and gap is not None and gap >= 0
-                 else (f"{gap:,}円" if gap is not None else "—"))
-        p50 = it.get("pred_p50"); p20 = it.get("pred_p20")
-        p50s = f"{int(p50):,}円" if isinstance(p50, (int,float)) else "—"
-        p20s = f"{int(p20):,}円" if isinstance(p20, (int,float)) else "—"
-        embeds.append({
-            "title": (it.get("title") or "")[:256],
-            "url": it.get("url"),
-            "description": f"{it.get('site','')} | {year}年 | {km_s} | {price}",
-            "fields": [
-                {"name": "Score",       "value": str(it.get("score", 0)),             "inline": True},
-                {"name": "Price Ratio", "value": str(it.get("price_ratio", '-')),     "inline": True},
-                {"name": "Urgency",     "value": "🔥" * it.get("urgency", 1),         "inline": True},
-                {"name": "Deal Gap",    "value": gap_s,                                "inline": True},
-                {"name": "p50(pred)",   "value": p50s,                                 "inline": True},
-                {"name": "p20(pred)",   "value": p20s,                                 "inline": True},
-            ],
-        })
-    payload = {
-        "content": f"🚗 **おすすめ中古車ピックアップ（即買い候補）**\n{datetime.now():%Y-%m-%d %H:%M}",
-        "embeds": embeds,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=12)
-        r.raise_for_status()
-        print("[OK] Discord 通知完了")
-    except Exception as e:
-        print(f"[WARN] Discord 通知失敗: {e}")
-
-# --- メイン ---
-def main():
-    targets = DEFAULT_TARGETS
-    tj = os.getenv("TARGETS_JSON")
-    if tj:
-        try:
-            targets = json.loads(tj)
-        except Exception as e:
-            print(f"[WARN] TARGETS_JSON の読み込み失敗: {e}")
-
-    all_picks: List[Dict[str, Any]] = []
-
-    for cfg in targets:
-        site = cfg.get("site")
-        url  = cfg.get("url")
-        pages = int(cfg.get("pages", 1))
-        parser = SITE_PARSERS.get(site)
-        if not parser:
-            print(f"[SKIP] 未対応サイト: {site}")
-            continue
-
-        collected: List[Dict[str, Any]] = []
-        for page in range(1, pages + 1):
-            u = url + (f"&page={page}" if page > 1 else "")
-            try:
-                print(f"[GET] {u}")
-                html = fetch(u)
-                items = parser(html)
-                # ★ SUVのみ + ハスラー除外（表記ゆれ吸収）
-                items = keyword_filter(
-                    items,
-                    include_keywords=cfg.get("include_keywords"),
-                    exclude_keywords=cfg.get("exclude_keywords")
-                )
-                collected.extend(items)
-            except requests.HTTPError as e:
-                code = getattr(e.response, "status_code", "?")
-                print(f"[HTTP {code}] {u}")
-            except Exception as e:
-                print(f"[ERR] {u}: {e}")
-
-        # 分位回帰 OOF 予測（十分な件数がある回だけ有効）
-        qpreds = oof_quantile_preds(collected, alphas=(0.5, 0.2))
-        for i, it in enumerate(collected):
-            it["pred_p50"] = qpreds.get(0.5, [None]*len(collected))[i] if collected else None
-            it["pred_p20"] = qpreds.get(0.2, [None]*len(collected))[i] if collected else None
-
-        # 中央値相場 → 評価
-        stats = compute_price_stats(collected)
-        for it in collected:
-            assess_deal(it, stats, cfg)
-
-        # L4+を優先、足りなければスコア上位で補完
-        picks = [x for x in collected if x.get("urgency", 1) >= 4]
-        if len(picks) < 8:
-            extra = sorted([x for x in collected if x not in picks],
-                           key=lambda x: x.get("score", 0), reverse=True)
-            picks.extend(extra[:8 - len(picks)])
-
-        print(f"  → 候補 {len(picks)} 件（{cfg.get('name')}）")
-        all_picks.extend(picks)
-
-    # 全体から上位10
-    all_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
-    top = all_picks[:10]
-
-    # CSV 出力
-    out_csv = "results.csv"
-    with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["title","url","site","year","mileage","price",
-                    "score","price_ratio","urgency","pred_p50","pred_p20","deal_gap"])
-        for it in top:
-            p50 = it.get("pred_p50"); p20 = it.get("pred_p20")
-            w.writerow([
-                it.get("title", ""), it.get("url", ""), it.get("site", ""),
-                it.get("year", 0), it.get("mileage", 0), it.get("price", 0),
-                it.get("score", 0), it.get("price_ratio", "-"), it.get("urgency", 1),
-                int(p50) if isinstance(p50, (int,float)) else "",
-                int(p20) if isinstance(p20, (int,float)) else "",
-                it.get("deal_gap","")
-            ])
-    print(f"[OK] CSV 出力: {out_csv}（{len(top)}件）")
-
-    # Discord 通知
-    discord_notify(top)
-
-if __name__ == "__main__":
-    main()
+        score = min(100, scor
