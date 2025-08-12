@@ -1,6 +1,7 @@
 name: Used Car Scout (Discord)
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 21 * * *"   # JST 06:00
     - cron: "0 3 * * *"    # JST 12:00
