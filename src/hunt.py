@@ -337,4 +337,230 @@ def assess_deal(it, stats, cfg):
         elif gap > 300_000:
             score = min(100, score + 5)
     if isinstance(pred20, (int, float)) and pred20 > 0 and price <= pred20:
-        score = min(100, scor
+        score = min(100, score + 5)
+
+    # 緊急度（1-5）
+    if score >= 90:   urgency = 5
+    elif score >= 80: urgency = 4
+    elif score >= 70: urgency = 3
+    elif score >= 60: urgency = 2
+    else:             urgency = 1
+    if price_ratio <= 0.6:
+        urgency = min(5, urgency + 1)
+    if gap is not None and gap > 500_000:
+        urgency = min(5, urgency + 1)
+
+    # 相場不明フォールバック（中央値が無い回）
+    if not median:
+        if (price and price <= 0.8 * cfg.get("price_max", 9e9)
+            and year and year >= cfg.get("year_min", 0) + 2
+            and km and km <= 0.7 * cfg.get("mileage_max", 9e9)):
+            urgency = max(urgency, 4)
+            score   = max(score, 80)
+
+    it["price_ratio"] = round(price_ratio, 2)
+    it["score"]       = score
+    it["urgency"]     = int(urgency)
+    it["deal_gap"]    = int(gap) if gap is not None else None
+
+# --------- Discord通知（共通） ---------
+def _post_discord(items: List[Dict[str, Any]], webhook_url: str | None, title_prefix: str):
+    if not items:
+        print(f"[INFO] {title_prefix} 通知対象なし")
+        return
+    if DRY_RUN:
+        preview = [{
+            "title": it.get("title"),
+            "url": it.get("url"),
+            "price": it.get("price"),
+            "year": it.get("year"),
+            "mileage": it.get("mileage"),
+            "score": it.get("score"),
+            "urgency": it.get("urgency"),
+            "price_ratio": it.get("price_ratio"),
+            "deal_gap": it.get("deal_gap"),
+        } for it in items]
+        print(f"[DRY-RUN] {title_prefix} payload preview:", json.dumps(preview, ensure_ascii=False, indent=2))
+        return
+    if not webhook_url:
+        print(f"[INFO] {title_prefix} 用Webhook未設定。通知スキップ")
+        return
+
+    embeds = []
+    for it in items[:5]:  # 各カテゴリ最大5件
+        price = f"{it.get('price',0):,}円" if it.get('price') else "—"
+        year  = it.get("year") or "—"
+        km    = it.get("mileage") or 0
+        km_s  = f"{km:,}km" if km else "—"
+        gap   = it.get("deal_gap")
+        gap_s = (f"+{gap:,}円" if isinstance(gap, int) and gap is not None and gap >= 0
+                 else (f"{gap:,}円" if gap is not None else "—"))
+        p50 = it.get("pred_p50"); p20 = it.get("pred_p20")
+        p50s = f"{int(p50):,}円" if isinstance(p50, (int,float)) else "—"
+        p20s = f"{int(p20):,}円" if isinstance(p20, (int,float)) else "—"
+        embeds.append({
+            "title": (it.get("title") or "")[:256],
+            "url": it.get("url"),
+            "description": f"{it.get('site','')} | {year}年 | {km_s} | {price}",
+            "fields": [
+                {"name": "Score",       "value": str(it.get("score", 0)),         "inline": True},
+                {"name": "Price Ratio", "value": str(it.get("price_ratio", '-')), "inline": True},
+                {"name": "Urgency",     "value": "🔥" * it.get("urgency", 1),     "inline": True},
+                {"name": "Deal Gap",    "value": gap_s,                            "inline": True},
+                {"name": "p50(pred)",   "value": p50s,                             "inline": True},
+                {"name": "p20(pred)",   "value": p20s,                             "inline": True},
+            ],
+        })
+    payload = {
+        "content": f"{title_prefix}\n{datetime.now():%Y-%m-%d %H:%M}",
+        "embeds": embeds,
+    }
+    try:
+        r = requests.post(webhook_url, json=payload, timeout=12)
+        r.raise_for_status()
+        print(f"[OK] Discord 通知完了: {title_prefix}")
+    except Exception as e:
+        print(f"[WARN] Discord 通知失敗({title_prefix}): {e}")
+
+# （後方互換）従来の単一チャンネル通知関数（今は未使用）
+def discord_notify(items: List[Dict[str, Any]]):
+    url = WEBHOOK_MAIN  # 旧: DISCORD_WEBHOOK_URL を含む
+    if DRY_RUN:
+        preview = [{
+            "title": it.get("title"),
+            "url": it.get("url"),
+            "price": it.get("price"),
+            "year": it.get("year"),
+            "mileage": it.get("mileage"),
+            "score": it.get("score"),
+            "urgency": it.get("urgency"),
+            "price_ratio": it.get("price_ratio"),
+            "deal_gap": it.get("deal_gap"),
+        } for it in items if it.get("urgency",1) >= 4]
+        print("[DRY-RUN] (legacy) Discord payload preview:", json.dumps(preview, ensure_ascii=False, indent=2))
+        return
+    if not url:
+        print("[INFO] DISCORD_WEBHOOK_URL 未設定。Discord通知をスキップ")
+        return
+    cands = [x for x in items if x.get("urgency", 1) >= IMMEDIATE_URGENCY_MIN][:5]
+    if not cands:
+        print("[INFO] Discord通知対象なし（即買い該当なし）")
+        return
+    # 送信本文フォーマットは _post_discord と同等でOKだが簡略
+    _post_discord(cands, url, "🚀 即買いレベル（legacy）")
+
+# --------- 候補の分割（即買い / ありかも） ---------
+def split_candidates(all_items: List[Dict[str, Any]]):
+    # 即買い：緊急度ベース（既定≧4）
+    immediate = [x for x in all_items if x.get("urgency",1) >= IMMEDIATE_URGENCY_MIN]
+
+    # ありかも：緊急度3 もしくは スコアがしきい値帯（70〜84.9）のもの
+    maybe = [x for x in all_items
+             if (x.get("urgency",1) == 3) or
+                (MAYBE_SCORE_MIN <= x.get("score",0) <= MAYBE_SCORE_MAX)]
+
+    # 重複除去（即買い優先）
+    ids = set(id(x) for x in immediate)
+    maybe = [x for x in maybe if id(x) not in ids]
+
+    # スコア順で並べる
+    immediate.sort(key=lambda x: x.get("score",0), reverse=True)
+    maybe.sort(key=lambda x: x.get("score",0), reverse=True)
+    return immediate[:5], maybe[:5]
+
+# --------- メイン ---------
+def main():
+    targets = DEFAULT_TARGETS
+    tj = os.getenv("TARGETS_JSON")
+    if tj:
+        try:
+            targets = json.loads(tj)
+        except Exception as e:
+            print(f"[WARN] TARGETS_JSON の読み込み失敗: {e}")
+
+    all_picks: List[Dict[str, Any]] = []
+    all_items: List[Dict[str, Any]] = []   # 全件プール（カテゴリ分割用）
+
+    for cfg in targets:
+        site = cfg.get("site")
+        url  = cfg.get("url")
+        pages = int(cfg.get("pages", 1))
+        parser = SITE_PARSERS.get(site)
+        if not parser:
+            print(f"[SKIP] 未対応サイト: {site}")
+            continue
+
+        collected: List[Dict[str, Any]] = []
+        for page in range(1, pages + 1):
+            u = url + (f"&page={page}" if page > 1 else "")
+            try:
+                print(f"[GET] {u}")
+                html = fetch(u)
+                items = parser(html)
+                # SUVのみ + ハスラー除外（表記ゆれ吸収）
+                items = keyword_filter(
+                    items,
+                    include_keywords=cfg.get("include_keywords"),
+                    exclude_keywords=cfg.get("exclude_keywords")
+                )
+                collected.extend(items)
+            except requests.HTTPError as e:
+                code = getattr(e.response, "status_code", "?")
+                print(f"[HTTP {code}] {u}")
+            except Exception as e:
+                print(f"[ERR] {u}: {e}")
+
+        # 分位回帰 OOF 予測（十分な件数がある回だけ有効）
+        qpreds = oof_quantile_preds(collected, alphas=(0.5, 0.2))
+        for i, it in enumerate(collected):
+            it["pred_p50"] = qpreds.get(0.5, [None]*len(collected))[i] if collected else None
+            it["pred_p20"] = qpreds.get(0.2, [None]*len(collected))[i] if collected else None
+
+        # 中央値相場 → 評価
+        stats = compute_price_stats(collected)
+        for it in collected:
+            assess_deal(it, stats, cfg)
+
+        all_items.extend(collected)  # カテゴリ分割用に全件を保持
+
+        # L4+を優先、足りなければスコア上位で補完（CSV用トップ候補）
+        picks = [x for x in collected if x.get("urgency", 1) >= 4]
+        if len(picks) < 8:
+            extra = sorted([x for x in collected if x not in picks],
+                           key=lambda x: x.get("score", 0), reverse=True)
+            picks.extend(extra[:8 - len(picks)])
+
+        print(f"  → 候補 {len(picks)} 件（{cfg.get('name')}）")
+        all_picks.extend(picks)
+
+    # 全体から上位10をCSVに出力（従来互換）
+    all_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
+    top = all_picks[:10]
+
+    out_csv = "results.csv"
+    with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["title","url","site","year","mileage","price",
+                    "score","price_ratio","urgency","pred_p50","pred_p20","deal_gap"])
+        for it in top:
+            p50 = it.get("pred_p50"); p20 = it.get("pred_p20")
+            w.writerow([
+                it.get("title", ""), it.get("url", ""), it.get("site", ""),
+                it.get("year", 0), it.get("mileage", 0), it.get("price", 0),
+                it.get("score", 0), it.get("price_ratio", "-"), it.get("urgency", 1),
+                int(p50) if isinstance(p50, (int,float)) else "",
+                int(p20) if isinstance(p20, (int,float)) else "",
+                it.get("deal_gap","")
+            ])
+    print(f"[OK] CSV 出力: {out_csv}（{len(top)}件）")
+
+    # 二段階通知
+    immediate, maybe = split_candidates(all_items)
+    _post_discord(immediate, WEBHOOK_MAIN,  "🚀 即買いレベル")
+    _post_discord(maybe,    WEBHOOK_MAYBE, "🤔 ありかもレベル")
+
+    # 後方互換の単一通知をどうしても使いたい場合は以下を有効化
+    # discord_notify(top)
+
+if __name__ == "__main__":
+    main()
