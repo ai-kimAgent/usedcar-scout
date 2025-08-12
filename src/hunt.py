@@ -1,202 +1,322 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Used-Car Scout（Discord通知版 / SUV監視・ハスラー除外 / ルール + 分位回帰ハイブリッド）
-- JSなしで取得できる範囲のリスト/リンク部から 年式/距離/価格/タイトル文字 を抽出
-- 相場1: 同回収データの価格中央値から price_ratio を算出（常時）
-- 相場2: 収集件数が十分な回は、分位回帰(Quantile GB)のOOFで p50(中央値) / p20(下位20%) を推定
-    * お得度 = p50 - 実売価格 でスコア/緊急度を後押し
-    * 実売価格 ≤ p20 なら強い割安としてさらにブースト
-- SUVのみ拾うための include_keywords / 除外 exclude_keywords（デフォで「ハスラー/HUSTLER」は常時除外）
-- 上位を results.csv に保存
-- Discord通知は二段構え：
-    * 🚀 即買いレベル … MAIN チャンネルへ（既定：緊急度≧4）
-    * 🤔 ありかもレベル … MAYBE チャンネルへ（既定：緊急度=3 または スコア70〜84.9）
+SUV特化型 Used-Car Scout（精密判定版 / Discord二段階通知）
+改良点:
+- SUV判定ロジックを大幅強化（車種DB + タイトル解析 + 詳細ページ確認）
+- 軽自動車（ハスラー等）の確実な除外
+- 車種情報の詳細取得と検証
+- より正確な相場分析
 
 環境変数:
   DISCORD_WEBHOOK_URL_MAIN  … 即買いレベルの通知先（必須推奨）
   DISCORD_WEBHOOK_URL_MAYBE … ありかもレベルの通知先（任意）
-  DISCORD_WEBHOOK_URL       … 旧単一Webhook名（MAINが未設定の時のフォールバック）
-  TARGETS_JSON              … 監視ターゲット上書き（任意のJSON文字列）
-  DISCORD_DRY_RUN           … "1" なら通知せず、送信内容をコンソールに出力（テスト用）
-
+  DISCORD_DRY_RUN           … "1" なら通知せず、送信内容をコンソールに出力
   IMMEDIATE_URGENCY_MIN     … 即買いレベルの緊急度しきい値（デフォルト "4"）
   MAYBE_SCORE_MIN           … ありかもレベルのスコア下限（デフォルト "70"）
-  MAYBE_SCORE_MAX           … ありかもレベルのスコア上限（デフォルト "84.9"）
 """
 from __future__ import annotations
-import os, re, csv, json, time, math
+import os, re, csv, json, time, math, random
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set, Tuple
 from unicodedata import normalize
+from dataclasses import dataclass, field
 
 import requests
 from bs4 import BeautifulSoup
-
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import KFold
 
-# --------- 通信設定 ---------
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
-HEADERS = {"User-Agent": UA, "Accept-Language": "ja,en;q=0.9"}
-
-# --------- 二段階通知のしきい値（環境変数で上書き可） ---------
-IMMEDIATE_URGENCY_MIN = int(os.getenv("IMMEDIATE_URGENCY_MIN", "4"))   # 即買い: 緊急度≧4
-MAYBE_SCORE_MIN = float(os.getenv("MAYBE_SCORE_MIN", "70"))            # ありかも: スコア下限
-MAYBE_SCORE_MAX = float(os.getenv("MAYBE_SCORE_MAX", "84.9"))          # ありかも: 上限(即買い未満)
-
-# Webhook（MAINは旧DISCORD_WEBHOOK_URLをフォールバック）
-WEBHOOK_MAIN  = os.getenv("DISCORD_WEBHOOK_URL_MAIN") or os.getenv("DISCORD_WEBHOOK_URL")
-WEBHOOK_MAYBE = os.getenv("DISCORD_WEBHOOK_URL_MAYBE")
-DRY_RUN = os.getenv("DISCORD_DRY_RUN", "0") == "1"
-
-# --------- SUV監視ターゲット（必要に応じて TARGETS_JSON で上書き推奨） ---------
-# include_keywords は SUVモデル名をざっくり網羅（表記ゆれは正規化で吸収）
-DEFAULT_TARGETS = [
-    {
-        "name": "トヨタSUV",
-        "site": "carsensor",
-        "url": "https://www.carsensor.net/usedcar/bTO/index.html?SORT=22",
-        "price_max": 4500000,
-        "year_min": 2014,
-        "mileage_max": 120000,
-        "pages": 1,
-        "include_keywords": [
-            "ハリアー","RAV4","C-HR","カローラクロス","ヤリスクロス",
-            "ランドクルーザー","プラド","ライズ"
-        ],
-        "exclude_keywords": []
-    },
-    {
-        "name": "スバルSUV",
-        "site": "carsensor",
-        "url": "https://www.carsensor.net/usedcar/bSU/index.html?SORT=22",
-        "price_max": 3800000,
-        "year_min": 2013,
-        "mileage_max": 140000,
-        "pages": 1,
-        "include_keywords": ["フォレスター","アウトバック","レガシィアウトバック","XV","CROSSTREK","クロストレック"],
-        "exclude_keywords": []
-    },
-    {
-        "name": "マツダSUV",
-        "site": "carsensor",
-        "url": "https://www.carsensor.net/usedcar/bMA/index.html?SORT=22",
-        "price_max": 3600000,
-        "year_min": 2015,
-        "mileage_max": 120000,
-        "pages": 1,
-        "include_keywords": ["CX-3","CX-30","CX-5","CX-8","CX-60"],
-        "exclude_keywords": []
-    },
-    {
-        "name": "日産SUV",
-        "site": "carsensor",
-        "url": "https://www.carsensor.net/usedcar/",
-        "price_max": 3800000,
-        "year_min": 2013,
-        "mileage_max": 140000,
-        "pages": 1,
-        "include_keywords": ["エクストレイル","キックス","ジューク","テラノ","ムラーノ"],
-        "exclude_keywords": []
-    },
-    {
-        "name": "ホンダSUV",
-        "site": "carsensor",
-        "url": "https://www.carsensor.net/usedcar/",
-        "price_max": 4200000,
-        "year_min": 2014,
-        "mileage_max": 130000,
-        "pages": 1,
-        "include_keywords": ["ヴェゼル","VEZEL","CR-V"],
-        "exclude_keywords": []
-    },
-    {
-        "name": "三菱SUV",
-        "site": "carsensor",
-        "url": "https://www.carsensor.net/usedcar/",
-        "price_max": 3800000,
-        "year_min": 2013,
-        "mileage_max": 140000,
-        "pages": 1,
-        "include_keywords": ["アウトランダー","RVR","パジェロ"],
-        "exclude_keywords": []
-    },
-    {
-        "name": "スズキSUV（ハスラー除外）",
-        "site": "carsensor",
-        "url": "https://www.carsensor.net/usedcar/",
-        "price_max": 3000000,
-        "year_min": 2015,
-        "mileage_max": 120000,
-        "pages": 1,
-        "include_keywords": ["ジムニー","ジムニーシエラ","エスクード","クロスビー"],
-        "exclude_keywords": []
-    }
+# ========== 通信設定 ==========
+UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
 ]
 
-# --------- 正規表現ヘルパ ---------
-_price_ja = re.compile(r"([0-9,.]+)\s*万円|([0-9,]+)\s*円")
-_km_ja    = re.compile(r"([0-9.]+)\s*万?km")
-_year_ja  = re.compile(r"(\d{4})年")
+def get_headers():
+    return {
+        "User-Agent": random.choice(UA_LIST),
+        "Accept-Language": "ja,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    }
 
-def textnum_to_int(val: str) -> int:
-    m = _price_ja.search(val)
-    if not m:
-        return 0
-    if m.group(1):  # 万円
-        n = float(m.group(1).replace(",", "")) * 10000
-        return int(n)
-    return int(m.group(2).replace(",", ""))
+# ========== SUV車種データベース ==========
+@dataclass
+class VehicleModel:
+    """車種情報"""
+    maker: str
+    model: str
+    name_variants: Set[str] = field(default_factory=set)
+    is_suv: bool = True
+    is_kei: bool = False  # 軽自動車フラグ
+    body_types: Set[str] = field(default_factory=set)
+    
+SUV_DATABASE = {
+    # トヨタ
+    "ハリアー": VehicleModel("トヨタ", "ハリアー", {"HARRIER", "harrier"}, True, False, {"SUV", "クロスオーバーSUV"}),
+    "RAV4": VehicleModel("トヨタ", "RAV4", {"ラヴフォー", "ラブフォー"}, True, False, {"SUV", "クロスオーバーSUV"}),
+    "ランドクルーザー": VehicleModel("トヨタ", "ランドクルーザー", {"LANDCRUISER", "ランクル", "LC"}, True, False, {"SUV", "クロカン"}),
+    "ランドクルーザープラド": VehicleModel("トヨタ", "プラド", {"PRADO", "ランクルプラド"}, True, False, {"SUV", "クロカン"}),
+    "C-HR": VehicleModel("トヨタ", "C-HR", {"CHR", "chr"}, True, False, {"SUV", "コンパクトSUV"}),
+    "カローラクロス": VehicleModel("トヨタ", "カローラクロス", {"COROLLA CROSS"}, True, False, {"SUV"}),
+    "ヤリスクロス": VehicleModel("トヨタ", "ヤリスクロス", {"YARIS CROSS"}, True, False, {"SUV", "コンパクトSUV"}),
+    "ライズ": VehicleModel("トヨタ", "ライズ", {"RAIZE"}, True, False, {"SUV", "コンパクトSUV"}),
+    "ハイラックス": VehicleModel("トヨタ", "ハイラックス", {"HILUX"}, True, False, {"ピックアップトラック", "SUV"}),
+    
+    # 日産
+    "エクストレイル": VehicleModel("日産", "エクストレイル", {"X-TRAIL", "XTRAIL"}, True, False, {"SUV"}),
+    "キックス": VehicleModel("日産", "キックス", {"KICKS", "e-POWER"}, True, False, {"SUV", "コンパクトSUV"}),
+    "ジューク": VehicleModel("日産", "ジューク", {"JUKE"}, True, False, {"SUV", "コンパクトSUV"}),
+    "ムラーノ": VehicleModel("日産", "ムラーノ", {"MURANO"}, True, False, {"SUV"}),
+    "テラノ": VehicleModel("日産", "テラノ", {"TERRANO"}, True, False, {"SUV", "クロカン"}),
+    "アリア": VehicleModel("日産", "アリア", {"ARIYA"}, True, False, {"SUV", "電気自動車"}),
+    
+    # ホンダ
+    "ヴェゼル": VehicleModel("ホンダ", "ヴェゼル", {"VEZEL", "ベゼル"}, True, False, {"SUV", "コンパクトSUV"}),
+    "CR-V": VehicleModel("ホンダ", "CR-V", {"CRV", "シーアールブイ"}, True, False, {"SUV"}),
+    "ZR-V": VehicleModel("ホンダ", "ZR-V", {"ZRV"}, True, False, {"SUV"}),
+    
+    # マツダ
+    "CX-3": VehicleModel("マツダ", "CX-3", {"cx3", "シーエックススリー"}, True, False, {"SUV", "コンパクトSUV"}),
+    "CX-30": VehicleModel("マツダ", "CX-30", {"cx30", "シーエックスサーティー"}, True, False, {"SUV"}),
+    "CX-5": VehicleModel("マツダ", "CX-5", {"cx5", "シーエックスファイブ"}, True, False, {"SUV"}),
+    "CX-8": VehicleModel("マツダ", "CX-8", {"cx8", "シーエックスエイト"}, True, False, {"SUV", "3列シート"}),
+    "CX-60": VehicleModel("マツダ", "CX-60", {"cx60"}, True, False, {"SUV"}),
+    "MX-30": VehicleModel("マツダ", "MX-30", {"mx30"}, True, False, {"SUV", "電動"}),
+    
+    # スバル
+    "フォレスター": VehicleModel("スバル", "フォレスター", {"FORESTER"}, True, False, {"SUV"}),
+    "XV": VehicleModel("スバル", "XV", {"CROSSTREK", "クロストレック"}, True, False, {"SUV", "クロスオーバー"}),
+    "レガシィアウトバック": VehicleModel("スバル", "アウトバック", {"OUTBACK", "レガシィ"}, True, False, {"SUV", "クロスオーバー"}),
+    "アセント": VehicleModel("スバル", "アセント", {"ASCENT"}, True, False, {"SUV", "3列シート"}),
+    
+    # 三菱
+    "アウトランダー": VehicleModel("三菱", "アウトランダー", {"OUTLANDER", "PHEV"}, True, False, {"SUV"}),
+    "エクリプスクロス": VehicleModel("三菱", "エクリプスクロス", {"ECLIPSE CROSS"}, True, False, {"SUV"}),
+    "RVR": VehicleModel("三菱", "RVR", {"アールブイアール"}, True, False, {"SUV", "コンパクトSUV"}),
+    "パジェロ": VehicleModel("三菱", "パジェロ", {"PAJERO"}, True, False, {"SUV", "クロカン"}),
+    
+    # スズキ（軽自動車は除外対象）
+    "ジムニー": VehicleModel("スズキ", "ジムニー", {"JIMNY"}, True, True, {"軽自動車", "クロカン"}),
+    "ジムニーシエラ": VehicleModel("スズキ", "ジムニーシエラ", {"JIMNY SIERRA"}, True, False, {"SUV", "クロカン"}),
+    "エスクード": VehicleModel("スズキ", "エスクード", {"ESCUDO"}, True, False, {"SUV"}),
+    "クロスビー": VehicleModel("スズキ", "クロスビー", {"XBEE", "CROSSBEE"}, True, False, {"SUV", "コンパクトSUV"}),
+    "ハスラー": VehicleModel("スズキ", "ハスラー", {"HUSTLER"}, False, True, {"軽自動車", "軽SUV"}),
+    "スペーシアギア": VehicleModel("スズキ", "スペーシアギア", {"SPACIA GEAR"}, False, True, {"軽自動車"}),
+    
+    # ダイハツ（軽自動車）
+    "タフト": VehicleModel("ダイハツ", "タフト", {"TAFT"}, False, True, {"軽自動車", "軽SUV"}),
+    "ロッキー": VehicleModel("ダイハツ", "ロッキー", {"ROCKY"}, True, False, {"SUV", "コンパクトSUV"}),
+    "テリオスキッド": VehicleModel("ダイハツ", "テリオスキッド", {"TERIOS KID"}, False, True, {"軽自動車"}),
+}
 
-def km_to_int(val: str) -> int:
-    m = _km_ja.search(val)
-    if not m:
-        return 0
-    s = m.group(1)
-    if "万" in val:
-        return int(float(s) * 10000)
-    return int(float(s))
+# 軽自動車の確実な除外リスト
+KEI_CAR_KEYWORDS = {
+    "ハスラー", "HUSTLER", "タフト", "TAFT", "スペーシアギア", "SPACIA GEAR",
+    "テリオスキッド", "TERIOS KID", "キャスト", "CAST", "アクティバ", "ACTIVA",
+    "ウェイク", "WAKE", "軽自動車", "軽SUV", "K-CAR", "660cc", "660CC"
+}
 
-def year_from_text(val: str) -> int:
-    m = _year_ja.search(val)
-    if not m:
-        return 0
-    return int(m.group(1))
+# ========== 車種判定エンジン ==========
+class VehicleClassifier:
+    """車種判定クラス"""
+    
+    def __init__(self):
+        self.suv_patterns = self._compile_patterns()
+        self.kei_patterns = re.compile(
+            r'(軽自動車|軽SUV|660cc|660CC|K-?CAR)', 
+            re.IGNORECASE
+        )
+        
+    def _compile_patterns(self) -> Dict[str, re.Pattern]:
+        """SUVパターンをコンパイル"""
+        patterns = {}
+        for key, model in SUV_DATABASE.items():
+            if model.is_suv and not model.is_kei:
+                # メインの車種名と別名をパターン化
+                all_names = {key, model.model} | model.name_variants
+                pattern_str = '|'.join(re.escape(name) for name in all_names)
+                patterns[key] = re.compile(pattern_str, re.IGNORECASE)
+        return patterns
+    
+    def classify(self, text: str, detailed_text: str = "") -> Tuple[bool, str, float]:
+        """
+        テキストからSUV判定
+        Returns: (is_suv, model_name, confidence)
+        """
+        normalized = normalize("NFKC", text.upper())
+        detailed_norm = normalize("NFKC", detailed_text.upper()) if detailed_text else ""
+        
+        # 軽自動車チェック（除外）
+        if self._is_kei_car(normalized + " " + detailed_norm):
+            return False, "軽自動車", 0.0
+        
+        # SUVモデル検出
+        for model_key, pattern in self.suv_patterns.items():
+            if pattern.search(text) or (detailed_text and pattern.search(detailed_text)):
+                model = SUV_DATABASE[model_key]
+                confidence = self._calculate_confidence(text, detailed_text, model)
+                return True, model_key, confidence
+        
+        # SUV関連キーワードチェック（弱い判定）
+        suv_keywords = {"SUV", "クロスオーバー", "クロカン", "4WD", "AWD", "オフロード"}
+        if any(kw in normalized for kw in suv_keywords):
+            return True, "不明SUV", 0.3
+        
+        return False, "", 0.0
+    
+    def _is_kei_car(self, text: str) -> bool:
+        """軽自動車判定"""
+        for kw in KEI_CAR_KEYWORDS:
+            if kw.upper() in text:
+                return True
+        if self.kei_patterns.search(text):
+            return True
+        return False
+    
+    def _calculate_confidence(self, title: str, detail: str, model: VehicleModel) -> float:
+        """信頼度計算"""
+        confidence = 0.7  # ベース信頼度
+        
+        # メーカー名が含まれていれば信頼度UP
+        if model.maker in title or model.maker in detail:
+            confidence += 0.15
+        
+        # ボディタイプが一致すれば信頼度UP  
+        for body_type in model.body_types:
+            if body_type in title or body_type in detail:
+                confidence += 0.1
+                break
+        
+        # 複数の別名が含まれていれば信頼度UP
+        variant_count = sum(1 for v in model.name_variants if v.upper() in title.upper())
+        confidence += min(variant_count * 0.05, 0.15)
+        
+        return min(confidence, 1.0)
 
-# --------- polite fetch ---------
-def fetch(url: str) -> str:
-    time.sleep(1.2)  # 負荷配慮（必要に応じてランダム化してもOK）
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return r.text
-
-# --------- サイト別パーサ ---------
-def parse_carsensor_list(html: str) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(html, "lxml")
-    items: List[Dict[str, Any]] = []
-    cards = soup.select(".cassette, .list, .cl-list-item, .cl-list-content") or []
-    if not cards:
-        cards = soup.select("a")
-    for c in cards:
+# ========== 詳細ページ取得 ==========
+def fetch_with_retry(url: str, max_retries: int = 2) -> Optional[str]:
+    """リトライ付きフェッチ"""
+    for attempt in range(max_retries + 1):
         try:
-            a = c.select_one("h3 a") or c.select_one("a")
-            if not a or not a.get("href"):
+            time.sleep(random.uniform(1.0, 2.0))  # ランダム待機
+            r = requests.get(url, headers=get_headers(), timeout=15)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            if attempt == max_retries:
+                print(f"[ERROR] Failed to fetch {url}: {e}")
+                return None
+            time.sleep(2 ** attempt)  # 指数バックオフ
+    return None
+
+def extract_vehicle_details(url: str, site: str) -> Dict[str, Any]:
+    """詳細ページから車両情報を抽出"""
+    html = fetch_with_retry(url)
+    if not html:
+        return {}
+    
+    soup = BeautifulSoup(html, "lxml")
+    details = {}
+    
+    if site == "carsensor":
+        # カーセンサーの詳細情報取得
+        details["body_type"] = _extract_text(soup, ".specWrap th:contains('ボディタイプ') + td")
+        details["model_year"] = _extract_text(soup, ".specWrap th:contains('年式') + td")
+        details["grade"] = _extract_text(soup, ".specWrap th:contains('グレード') + td")
+        details["engine"] = _extract_text(soup, ".specWrap th:contains('排気量') + td")
+        details["drive_type"] = _extract_text(soup, ".specWrap th:contains('駆動方式') + td")
+        details["color"] = _extract_text(soup, ".specWrap th:contains('車体色') + td")
+        details["equipment"] = _extract_equipment_carsensor(soup)
+        
+    elif site == "goonet":
+        # Goo-netの詳細情報取得
+        details["body_type"] = _extract_text(soup, "th:contains('ボディタイプ') + td")
+        details["model_year"] = _extract_text(soup, "th:contains('年式') + td")
+        details["grade"] = _extract_text(soup, "th:contains('グレード') + td")
+        details["engine"] = _extract_text(soup, "th:contains('排気量') + td")
+        details["drive_type"] = _extract_text(soup, "th:contains('駆動') + td")
+        details["equipment"] = _extract_equipment_goonet(soup)
+    
+    # 説明文から追加情報
+    description = soup.get_text(" ", strip=True)[:2000]  # 最初の2000文字
+    details["description"] = description
+    
+    return details
+
+def _extract_text(soup, selector: str) -> str:
+    """セレクタからテキスト抽出"""
+    elem = soup.select_one(selector)
+    return elem.get_text(strip=True) if elem else ""
+
+def _extract_equipment_carsensor(soup) -> List[str]:
+    """カーセンサーから装備抽出"""
+    equipment = []
+    equip_section = soup.select(".equipment li, .equipmentList li")
+    for item in equip_section[:20]:  # 最大20個
+        equipment.append(item.get_text(strip=True))
+    return equipment
+
+def _extract_equipment_goonet(soup) -> List[str]:
+    """Goo-netから装備抽出"""
+    equipment = []
+    equip_section = soup.select(".equipment span, .icon-list li")
+    for item in equip_section[:20]:
+        equipment.append(item.get_text(strip=True))
+    return equipment
+
+# ========== パーサー改良版 ==========
+def parse_carsensor_list_enhanced(html: str) -> List[Dict[str, Any]]:
+    """カーセンサーのリストページ解析（強化版）"""
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    classifier = VehicleClassifier()
+    
+    # 車両カードを取得
+    cards = soup.select(".cassette__inner, .cassetteMain, .js-listTableCassette")
+    if not cards:
+        cards = soup.select("article, .itemBox")
+    
+    for card in cards:
+        try:
+            # 基本情報取得
+            title_elem = card.select_one("h3 a, .cassetteMain__title a, h2 a")
+            if not title_elem:
                 continue
-            title = a.get_text(strip=True)
-            url = a["href"]
+                
+            title = title_elem.get_text(strip=True)
+            url = title_elem.get("href", "")
             if url.startswith("/"):
                 url = "https://www.carsensor.net" + url
-            t = c.get_text(" ", strip=True)
-            price = textnum_to_int(t)
-            year = year_from_text(t)
-            mileage = km_to_int(t)
-            if price == 0 and ("価格" in t or "万円" in t):
-                continue
+            
+            # 車種判定（第1段階）
+            is_suv, model_name, confidence = classifier.classify(title)
+            if not is_suv or confidence < 0.3:
+                continue  # SUVでない or 信頼度が低い
+            
+            # 価格・年式・走行距離の抽出
+            text = card.get_text(" ", strip=True)
+            price = _extract_price(text)
+            year = _extract_year(text)
+            mileage = _extract_mileage(text)
+            
+            # ボディタイプの確認（可能な場合）
+            body_type_elem = card.select_one(".cassetteMain__etc span:contains('SUV'), .bodyType")
+            body_type = body_type_elem.get_text(strip=True) if body_type_elem else ""
+            
+            # 修復歴チェック
+            has_repair = "修復歴あり" in text or "R" in text
+            
+            # グレード情報
+            grade_elem = card.select_one(".cassetteMain__grade, .grade")
+            grade = grade_elem.get_text(strip=True) if grade_elem else ""
+            
             items.append({
                 "title": title,
                 "url": url,
@@ -204,363 +324,611 @@ def parse_carsensor_list(html: str) -> List[Dict[str, Any]]:
                 "mileage": mileage,
                 "price": price,
                 "site": "carsensor",
+                "model_name": model_name,
+                "confidence": confidence,
+                "body_type": body_type,
+                "grade": grade,
+                "has_repair": has_repair,
+                "raw_text": text[:500]  # デバッグ用
             })
-        except Exception:
+            
+        except Exception as e:
+            print(f"[WARN] Parse error: {e}")
             continue
+    
     return items
 
-def parse_goonet_list(html: str) -> List[Dict[str, Any]]:
+def parse_goonet_list_enhanced(html: str) -> List[Dict[str, Any]]:
+    """Goo-netのリストページ解析（強化版）"""
     soup = BeautifulSoup(html, "lxml")
-    items: List[Dict[str, Any]] = []
-    rows = soup.select("a")
-    for a in rows:
-        href = a.get("href", "")
-        if "/usedcar/" in href or "goo-net.com/usedcar" in href:
-            title = a.get_text(strip=True)
-            url = href if href.startswith("http") else "https://www.goo-net.com" + href
-            t = a.get_text(" ", strip=True)
+    items = []
+    classifier = VehicleClassifier()
+    
+    # 車両要素を取得
+    cars = soup.select(".car-list-unit, .used-car-list-wrap article, .item-wrap")
+    
+    for car in cars:
+        try:
+            title_elem = car.select_one("h3 a, h2 a, .item-name a")
+            if not title_elem:
+                continue
+                
+            title = title_elem.get_text(strip=True)
+            url = title_elem.get("href", "")
+            if not url.startswith("http"):
+                url = "https://www.goo-net.com" + url
+            
+            # SUV判定
+            is_suv, model_name, confidence = classifier.classify(title)
+            if not is_suv or confidence < 0.3:
+                continue
+            
+            text = car.get_text(" ", strip=True)
+            price = _extract_price(text)
+            year = _extract_year(text)
+            mileage = _extract_mileage(text)
+            
+            # グレード・色情報
+            spec_elem = car.select_one(".spec-wrap, .item-spec")
+            grade = spec_elem.get_text(strip=True) if spec_elem else ""
+            
             items.append({
                 "title": title,
                 "url": url,
-                "year": year_from_text(t),
-                "mileage": km_to_int(t),
-                "price": textnum_to_int(t),
+                "year": year,
+                "mileage": mileage,
+                "price": price,
                 "site": "goonet",
+                "model_name": model_name,
+                "confidence": confidence,
+                "grade": grade,
+                "raw_text": text[:500]
             })
+            
+        except Exception as e:
+            print(f"[WARN] Parse error: {e}")
+            continue
+    
     return items
 
-SITE_PARSERS = {
-    "carsensor": parse_carsensor_list,
-    "goonet":    parse_goonet_list,
-}
-
-# --------- タイトル正規化 & キーワードフィルタ（SUVだけ/ハスラー除外） ---------
-def _norm(s: str) -> str:
-    return normalize("NFKC", (s or "")).upper()  # 全角→半角/記号正規化＋大文字化
-
-def keyword_filter(items, include_keywords=None, exclude_keywords=None):
-    inc = [_norm(k) for k in (include_keywords or [])]
-    # デフォでハスラー/HUSTLERを除外に追加
-    exc = {_norm(k) for k in ((exclude_keywords or []) + ["ハスラー", "HUSTLER"])}
-    out = []
-    for it in items:
-        title_n = _norm(it.get("title", ""))
-        if inc and not any(k in title_n for k in inc):
-            continue
-        if any(k in title_n for k in exc):
-            continue
-        out.append(it)
-    return out
-
-# --------- 相場/判定（ルール） ---------
-def _percentile(sorted_list, p: float):
-    if not sorted_list:
-        return None
-    k = (len(sorted_list) - 1) * p
-    f, c = math.floor(k), math.ceil(k)
-    if f == c:
-        return sorted_list[int(k)]
-    return sorted_list[f] * (c - k) + sorted_list[c] * (k - f)
-
-def compute_price_stats(items):
-    prices = [it.get("price") for it in items if it.get("price")]
-    if len(prices) < 4:
-        return {"median": None, "q25": None}
-    s = sorted(prices)
-    return {"median": _percentile(s, 0.5), "q25": _percentile(s, 0.25)}
-
-# --------- 分位回帰 OOF: p50 / p20 予測 ---------
-def _feat(it: Dict[str, Any]):
-    title = (it.get("title") or "")
-    return [
-        it.get("year") or 0,
-        it.get("mileage") or 0,
-        1 if "サンルーフ" in title else 0,
-        1 if "レザー" in title else 0,
-        1 if "BOSE" in title else 0,
-        1 if "JBL"  in title else 0,
+# ========== 数値抽出ヘルパー ==========
+def _extract_price(text: str) -> int:
+    """価格抽出（改良版）"""
+    patterns = [
+        r"([0-9,]+(?:\.[0-9]+)?)\s*万円",
+        r"￥([0-9,]+)",
+        r"([0-9,]+)円"
     ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            val = m.group(1).replace(",", "")
+            if "万円" in m.group(0):
+                return int(float(val) * 10000)
+            return int(float(val))
+    return 0
 
-def oof_quantile_preds(collected: List[Dict[str, Any]], alphas=(0.5, 0.2)):
-    X = np.array([_feat(it) for it in collected], dtype=float)
-    y = np.array([it.get("price") or 0 for it in collected], dtype=float)
-    n = len(collected)
-    if n < 12 or y.sum() == 0:
-        return {a: [None]*n for a in alphas}
-    kf = KFold(n_splits=3, shuffle=True, random_state=42)
-    out = {a: np.zeros(n) for a in alphas}
-    for a in alphas:
-        preds = np.zeros(n)
-        for tr, te in kf.split(X):
-            mdl = GradientBoostingRegressor(loss="quantile", alpha=a, random_state=42)
-            mdl.fit(X[tr], y[tr])
-            preds[te] = mdl.predict(X[te])
-        out[a] = preds
-    return {a: v.tolist() for a, v in out.items()}
+def _extract_year(text: str) -> int:
+    """年式抽出"""
+    patterns = [
+        r"(\d{4})年式",
+        r"(\d{4})年",
+        r"H(\d{2})年",  # 平成
+        r"R(\d{1,2})年"  # 令和
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            if pattern.startswith("H"):
+                return 1988 + int(m.group(1))  # 平成変換
+            elif pattern.startswith("R"):
+                return 2018 + int(m.group(1))  # 令和変換
+            else:
+                year = int(m.group(1))
+                if 2000 <= year <= 2030:
+                    return year
+    return 0
 
-def assess_deal(it, stats, cfg):
-    now = datetime.now().year
-    price = it.get("price") or 0
-    year  = it.get("year") or 0
-    km    = it.get("mileage") or 0
-    age   = max(0, now - year) if year else 15
+def _extract_mileage(text: str) -> int:
+    """走行距離抽出"""
+    patterns = [
+        r"([0-9.]+)\s*万\s*km",
+        r"([0-9,]+)\s*km"
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            val = m.group(1).replace(",", "")
+            if "万" in m.group(0):
+                return int(float(val) * 10000)
+            return int(float(val))
+    return 0
 
-    median = (stats or {}).get("median") or 0
-    price_ratio = (price / median) if (price and median) else 1.0
-
-    # ベース（価格比重視）
-    if price_ratio <= 0.6:   base = 95
-    elif price_ratio <= 0.7: base = 85
-    elif price_ratio <= 0.8: base = 75
-    elif price_ratio <= 0.9: base = 60
-    elif price_ratio <= 1.0: base = 45
-    else:                    base = 30
-
-    # 微調整（年式/距離/文字）
-    adj = 0
-    if age <= 8: adj += 5
-    if km and km <= 0.7 * cfg.get("mileage_max", 150_000): adj += 5
-    title = (it.get("title") or "")
-    if any(k in title for k in ["サンルーフ", "レザー", "BOSE", "JBL"]): adj += 3
-    if any(k in title for k in ["修復歴", "事故", "冠水"]):               adj -= 20
-
-    score = max(0, min(100, base + adj))
-
-    # 予測ベース（OOF）ブースト
-    pred50 = it.get("pred_p50")
-    pred20 = it.get("pred_p20")
-    gap = None
-    if isinstance(pred50, (int, float)) and pred50 > 0:
-        gap = pred50 - price
-        if gap > 500_000:
-            score = min(100, score + 8)
-        elif gap > 300_000:
-            score = min(100, score + 5)
-    if isinstance(pred20, (int, float)) and pred20 > 0 and price <= pred20:
-        score = min(100, score + 5)
-
-    # 緊急度（1-5）
-    if score >= 90:   urgency = 5
-    elif score >= 80: urgency = 4
-    elif score >= 70: urgency = 3
-    elif score >= 60: urgency = 2
-    else:             urgency = 1
-    if price_ratio <= 0.6:
+# ========== 評価エンジン（改良版） ==========
+def compute_enhanced_score(item: Dict[str, Any], market_stats: Dict, config: Dict) -> None:
+    """強化版スコアリング"""
+    price = item.get("price", 0)
+    year = item.get("year", 0)
+    mileage = item.get("mileage", 0)
+    confidence = item.get("confidence", 0.5)
+    
+    if not price:
+        item["score"] = 0
+        item["urgency"] = 0
+        return
+    
+    # 基本スコア計算
+    base_score = 50
+    
+    # 価格評価
+    median_price = market_stats.get("median", 0)
+    if median_price:
+        price_ratio = price / median_price
+        if price_ratio <= 0.6:
+            base_score = 95
+        elif price_ratio <= 0.7:
+            base_score = 85
+        elif price_ratio <= 0.8:
+            base_score = 75
+        elif price_ratio <= 0.9:
+            base_score = 65
+        item["price_ratio"] = round(price_ratio, 2)
+    
+    # 年式評価
+    current_year = datetime.now().year
+    age = current_year - year if year else 99
+    if age <= 3:
+        base_score += 15
+    elif age <= 5:
+        base_score += 10
+    elif age <= 8:
+        base_score += 5
+    elif age >= 15:
+        base_score -= 10
+    
+    # 走行距離評価
+    if mileage:
+        annual_mileage = mileage / max(age, 1)
+        if annual_mileage <= 5000:
+            base_score += 15
+        elif annual_mileage <= 8000:
+            base_score += 10
+        elif annual_mileage <= 12000:
+            base_score += 5
+        elif annual_mileage >= 20000:
+            base_score -= 10
+    
+    # SUV信頼度による調整
+    base_score = base_score * (0.7 + 0.3 * confidence)
+    
+    # 装備による加点
+    title = item.get("title", "")
+    premium_keywords = [
+        "サンルーフ", "レザー", "革シート", "BOSE", "JBL", 
+        "マークレビンソン", "360度", "プロパイロット", "アイサイト",
+        "ハンズフリー", "電動リアゲート", "マトリクスLED"
+    ]
+    for kw in premium_keywords:
+        if kw in title:
+            base_score += 2
+    
+    # 修復歴による減点
+    if item.get("has_repair"):
+        base_score -= 25
+    
+    # 予測価格との差額評価
+    if "pred_p50" in item and item["pred_p50"]:
+        gap = item["pred_p50"] - price
+        if gap > 500000:
+            base_score += 10
+        elif gap > 300000:
+            base_score += 7
+        elif gap > 100000:
+            base_score += 4
+        item["deal_gap"] = int(gap)
+    
+    # スコア正規化
+    score = max(0, min(100, base_score))
+    
+    # 緊急度判定
+    if score >= 90:
+        urgency = 5
+    elif score >= 80:
+        urgency = 4
+    elif score >= 70:
+        urgency = 3
+    elif score >= 60:
+        urgency = 2
+    else:
+        urgency = 1
+    
+    # 特別条件による緊急度ブースト
+    if median_price and price <= median_price * 0.6:
         urgency = min(5, urgency + 1)
-    if gap is not None and gap > 500_000:
-        urgency = min(5, urgency + 1)
+    
+    item["score"] = round(score, 1)
+    item["urgency"] = urgency
 
-    # 相場不明フォールバック（中央値が無い回）
-    if not median:
-        if (price and price <= 0.8 * cfg.get("price_max", 9e9)
-            and year and year >= cfg.get("year_min", 0) + 2
-            and km and km <= 0.7 * cfg.get("mileage_max", 9e9)):
-            urgency = max(urgency, 4)
-            score   = max(score, 80)
+# ========== 分位回帰予測 ==========
+def build_features(item: Dict[str, Any]) -> List[float]:
+    """特徴量構築（拡張版）"""
+    title = item.get("title", "")
+    current_year = datetime.now().year
+    
+    features = [
+        item.get("year", 0),
+        item.get("mileage", 0),
+        current_year - item.get("year", current_year) if item.get("year") else 15,  # 車齢
+        item.get("confidence", 0.5),  # SUV判定信頼度
+        
+        # 装備フラグ
+        1 if "サンルーフ" in title else 0,
+        1 if any(kw in title for kw in ["レザー", "革シート", "本革"]) else 0,
+        1 if any(kw in title for kw in ["BOSE", "JBL", "マークレビンソン"]) else 0,
+        1 if any(kw in title for kw in ["4WD", "AWD", "四駆"]) else 0,
+        1 if "ハイブリッド" in title else 0,
+        1 if "ターボ" in title else 0,
+        1 if item.get("has_repair", False) else 0,
+        
+        # モデル別ダミー変数（主要モデル）
+        1 if "ハリアー" in title else 0,
+        1 if "RAV4" in title else 0,
+        1 if "CX-5" in title else 0,
+        1 if "フォレスター" in title else 0,
+        1 if "エクストレイル" in title else 0,
+    ]
+    
+    return features
 
-    it["price_ratio"] = round(price_ratio, 2)
-    it["score"]       = score
-    it["urgency"]     = int(urgency)
-    it["deal_gap"]    = int(gap) if gap is not None else None
-
-# --------- Discord通知（共通） ---------
-def _post_discord(items: List[Dict[str, Any]], webhook_url: str | None, title_prefix: str):
-    if not items:
-        print(f"[INFO] {title_prefix} 通知対象なし")
-        return
-    if DRY_RUN:
-        preview = [{
-            "title": it.get("title"),
-            "url": it.get("url"),
-            "price": it.get("price"),
-            "year": it.get("year"),
-            "mileage": it.get("mileage"),
-            "score": it.get("score"),
-            "urgency": it.get("urgency"),
-            "price_ratio": it.get("price_ratio"),
-            "deal_gap": it.get("deal_gap"),
-        } for it in items]
-        print(f"[DRY-RUN] {title_prefix} payload preview:", json.dumps(preview, ensure_ascii=False, indent=2))
-        return
-    if not webhook_url:
-        print(f"[INFO] {title_prefix} 用Webhook未設定。通知スキップ")
-        return
-
-    embeds = []
-    for it in items[:5]:  # 各カテゴリ最大5件
-        price = f"{it.get('price',0):,}円" if it.get('price') else "—"
-        year  = it.get("year") or "—"
-        km    = it.get("mileage") or 0
-        km_s  = f"{km:,}km" if km else "—"
-        gap   = it.get("deal_gap")
-        gap_s = (f"+{gap:,}円" if isinstance(gap, int) and gap is not None and gap >= 0
-                 else (f"{gap:,}円" if gap is not None else "—"))
-        p50 = it.get("pred_p50"); p20 = it.get("pred_p20")
-        p50s = f"{int(p50):,}円" if isinstance(p50, (int,float)) else "—"
-        p20s = f"{int(p20):,}円" if isinstance(p20, (int,float)) else "—"
-        embeds.append({
-            "title": (it.get("title") or "")[:256],
-            "url": it.get("url"),
-            "description": f"{it.get('site','')} | {year}年 | {km_s} | {price}",
-            "fields": [
-                {"name": "Score",       "value": str(it.get("score", 0)),         "inline": True},
-                {"name": "Price Ratio", "value": str(it.get("price_ratio", '-')), "inline": True},
-                {"name": "Urgency",     "value": "🔥" * it.get("urgency", 1),     "inline": True},
-                {"name": "Deal Gap",    "value": gap_s,                            "inline": True},
-                {"name": "p50(pred)",   "value": p50s,                             "inline": True},
-                {"name": "p20(pred)",   "value": p20s,                             "inline": True},
-            ],
-        })
-    payload = {
-        "content": f"{title_prefix}\n{datetime.now():%Y-%m-%d %H:%M}",
-        "embeds": embeds,
-    }
-    try:
-        r = requests.post(webhook_url, json=payload, timeout=12)
-        r.raise_for_status()
-        print(f"[OK] Discord 通知完了: {title_prefix}")
-    except Exception as e:
-        print(f"[WARN] Discord 通知失敗({title_prefix}): {e}")
-
-# （後方互換）従来の単一チャンネル通知関数（今は未使用）
-def discord_notify(items: List[Dict[str, Any]]):
-    url = WEBHOOK_MAIN  # 旧: DISCORD_WEBHOOK_URL を含む
-    if DRY_RUN:
-        preview = [{
-            "title": it.get("title"),
-            "url": it.get("url"),
-            "price": it.get("price"),
-            "year": it.get("year"),
-            "mileage": it.get("mileage"),
-            "score": it.get("score"),
-            "urgency": it.get("urgency"),
-            "price_ratio": it.get("price_ratio"),
-            "deal_gap": it.get("deal_gap"),
-        } for it in items if it.get("urgency",1) >= 4]
-        print("[DRY-RUN] (legacy) Discord payload preview:", json.dumps(preview, ensure_ascii=False, indent=2))
-        return
-    if not url:
-        print("[INFO] DISCORD_WEBHOOK_URL 未設定。Discord通知をスキップ")
-        return
-    cands = [x for x in items if x.get("urgency", 1) >= IMMEDIATE_URGENCY_MIN][:5]
-    if not cands:
-        print("[INFO] Discord通知対象なし（即買い該当なし）")
-        return
-    # 送信本文フォーマットは _post_discord と同等でOKだが簡略
-    _post_discord(cands, url, "🚀 即買いレベル（legacy）")
-
-# --------- 候補の分割（即買い / ありかも） ---------
-def split_candidates(all_items: List[Dict[str, Any]]):
-    # 即買い：緊急度ベース（既定≧4）
-    immediate = [x for x in all_items if x.get("urgency",1) >= IMMEDIATE_URGENCY_MIN]
-
-    # ありかも：緊急度3 もしくは スコアがしきい値帯（70〜84.9）のもの
-    maybe = [x for x in all_items
-             if (x.get("urgency",1) == 3) or
-                (MAYBE_SCORE_MIN <= x.get("score",0) <= MAYBE_SCORE_MAX)]
-
-    # 重複除去（即買い優先）
-    ids = set(id(x) for x in immediate)
-    maybe = [x for x in maybe if id(x) not in ids]
-
-    # スコア順で並べる
-    immediate.sort(key=lambda x: x.get("score",0), reverse=True)
-    maybe.sort(key=lambda x: x.get("score",0), reverse=True)
-    return immediate[:5], maybe[:5]
-
-# --------- メイン ---------
-def main():
-    targets = DEFAULT_TARGETS
-    tj = os.getenv("TARGETS_JSON")
-    if tj:
+def predict_quantiles(items: List[Dict[str, Any]], quantiles=(0.5, 0.2)) -> Dict[float, np.ndarray]:
+    """分位回帰による価格予測"""
+    if len(items) < 20:
+        return {q: np.array([None] * len(items)) for q in quantiles}
+    
+    X = np.array([build_features(item) for item in items])
+    y = np.array([item.get("price", 0) for item in items])
+    
+    # 価格が0の項目を除外
+    valid_mask = y > 0
+    if valid_mask.sum() < 15:
+        return {q: np.array([None] * len(items)) for q in quantiles}
+    
+    predictions = {}
+    
+    for q in quantiles:
+        preds = np.full(len(items), np.nan)
+        kf = KFold(n_splits=min(5, valid_mask.sum() // 3), shuffle=True, random_state=42)
+        
         try:
-            targets = json.loads(tj)
+            for train_idx, val_idx in kf.split(X[valid_mask]):
+                # 有効なデータのインデックスを取得
+                valid_indices = np.where(valid_mask)[0]
+                train_indices = valid_indices[train_idx]
+                val_indices = valid_indices[val_idx]
+                
+                model = GradientBoostingRegressor(
+                    loss="quantile",
+                    alpha=q,
+                    n_estimators=100,
+                    max_depth=4,
+                    learning_rate=0.1,
+                    random_state=42
+                )
+                
+                model.fit(X[train_indices], y[train_indices])
+                preds[val_indices] = model.predict(X[val_indices])
+            
         except Exception as e:
-            print(f"[WARN] TARGETS_JSON の読み込み失敗: {e}")
+            print(f"[WARN] Quantile regression failed: {e}")
+            return {q: np.array([None] * len(items)) for q in quantiles}
+        
+        predictions[q] = preds
+    
+    return predictions
 
-    all_picks: List[Dict[str, Any]] = []
-    all_items: List[Dict[str, Any]] = []   # 全件プール（カテゴリ分割用）
+# ========== Discord通知（改良版） ==========
+def send_discord_notification(items: List[Dict[str, Any]], webhook_url: str, category: str):
+    """Discord通知送信"""
+    if not items:
+        print(f"[INFO] {category}: 通知対象なし")
+        return
+    
+    if os.getenv("DISCORD_DRY_RUN", "0") == "1":
+        print(f"[DRY-RUN] {category} 通知:")
+        for item in items[:3]:
+            print(f"  - {item['title'][:50]}... Score:{item['score']} Price:{item['price']:,}円")
+        return
+    
+    if not webhook_url:
+        print(f"[WARN] {category}: Webhook URL未設定")
+        return
+    
+    embeds = []
+    for item in items[:5]:
+        price = item.get("price", 0)
+        year = item.get("year", 0)
+        mileage = item.get("mileage", 0)
+        
+        fields = [
+            {"name": "価格", "value": f"{price:,}円", "inline": True},
+            {"name": "年式", "value": f"{year}年", "inline": True},
+            {"name": "走行距離", "value": f"{mileage:,}km", "inline": True},
+            {"name": "スコア", "value": f"{item.get('score', 0):.1f}", "inline": True},
+            {"name": "緊急度", "value": "🔥" * item.get("urgency", 1), "inline": True},
+            {"name": "SUV判定", "value": f"{item.get('model_name', '不明')} ({item.get('confidence', 0):.0%})", "inline": True},
+        ]
+        
+        if item.get("price_ratio"):
+            fields.append({"name": "相場比", "value": f"{item['price_ratio']:.0%}", "inline": True})
+        
+        if item.get("deal_gap"):
+            fields.append({"name": "予測差額", "value": f"+{item['deal_gap']:,}円", "inline": True})
+        
+        color = 0xFF0000 if item.get("urgency", 1) >= 4 else 0xFFAA00 if item.get("urgency", 1) >= 3 else 0x00AA00
+        
+        embeds.append({
+            "title": item.get("title", "不明")[:256],
+            "url": item.get("url", ""),
+            "color": color,
+            "fields": fields,
+            "footer": {"text": f"{item.get('site', '')} | {item.get('grade', '')}"}
+        })
+    
+    payload = {
+        "content": f"**{category}** - {datetime.now():%Y/%m/%d %H:%M}",
+        "embeds": embeds
+    }
+    
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=10)
+        response.raise_for_status()
+        print(f"[SUCCESS] {category}: {len(items)}件通知完了")
+    except Exception as e:
+        print(f"[ERROR] Discord通知失敗 ({category}): {e}")
 
-    for cfg in targets:
-        site = cfg.get("site")
-        url  = cfg.get("url")
-        pages = int(cfg.get("pages", 1))
-        parser = SITE_PARSERS.get(site)
-        if not parser:
+# ========== 監視設定 ==========
+MONITORING_CONFIGS = [
+    {
+        "name": "トヨタSUV",
+        "site": "carsensor",
+        "base_url": "https://www.carsensor.net/usedcar/bTO/index.html",
+        "params": {
+            "SORT": "22",  # 新着順
+            "SHASHU": "ハリアー|RAV4|ランドクルーザー|C-HR|カローラクロス|ヤリスクロス"
+        },
+        "price_max": 5000000,
+        "year_min": 2015,
+        "mileage_max": 100000,
+        "pages": 2
+    },
+    {
+        "name": "マツダSUV",
+        "site": "carsensor",
+        "base_url": "https://www.carsensor.net/usedcar/bMA/index.html",
+        "params": {
+            "SORT": "22",
+            "BODY": "SUV"
+        },
+        "price_max": 4000000,
+        "year_min": 2016,
+        "mileage_max": 80000,
+        "pages": 2
+    },
+    {
+        "name": "スバルSUV",
+        "site": "carsensor",
+        "base_url": "https://www.carsensor.net/usedcar/bSU/index.html",
+        "params": {
+            "SORT": "22",
+            "SHASHU": "フォレスター|XV|レガシィアウトバック|アウトバック"
+        },
+        "price_max": 4000000,
+        "year_min": 2015,
+        "mileage_max": 90000,
+        "pages": 2
+    },
+    {
+        "name": "日産・ホンダSUV",
+        "site": "carsensor",
+        "base_url": "https://www.carsensor.net/usedcar/index.html",
+        "params": {
+            "MAKER": "NI|HO",  # 日産・ホンダ
+            "BODY": "SUV",
+            "SORT": "22"
+        },
+        "price_max": 4500000,
+        "year_min": 2015,
+        "mileage_max": 100000,
+        "pages": 2
+    },
+    {
+        "name": "Goo-net SUV",
+        "site": "goonet",
+        "base_url": "https://www.goo-net.com/usedcar/",
+        "params": {
+            "body_type": "suv",
+            "sort": "update_desc"
+        },
+        "price_max": 5000000,
+        "year_min": 2015,
+        "mileage_max": 100000,
+        "pages": 1
+    }
+]
+
+# ========== メイン処理 ==========
+def main():
+    """メイン処理"""
+    print("=" * 60)
+    print("SUV特化型中古車スカウト - 起動")
+    print(f"実行時刻: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    print("=" * 60)
+    
+    # 環境変数読み込み
+    webhook_main = os.getenv("DISCORD_WEBHOOK_URL_MAIN") or os.getenv("DISCORD_WEBHOOK_URL")
+    webhook_maybe = os.getenv("DISCORD_WEBHOOK_URL_MAYBE")
+    immediate_min = int(os.getenv("IMMEDIATE_URGENCY_MIN", "4"))
+    maybe_score_min = float(os.getenv("MAYBE_SCORE_MIN", "70"))
+    maybe_score_max = float(os.getenv("MAYBE_SCORE_MAX", "84.9"))
+    
+    # カスタム設定があれば読み込み
+    custom_config = os.getenv("TARGETS_JSON")
+    if custom_config:
+        try:
+            MONITORING_CONFIGS.clear()
+            MONITORING_CONFIGS.extend(json.loads(custom_config))
+            print(f"[INFO] カスタム設定を読み込みました")
+        except Exception as e:
+            print(f"[ERROR] TARGETS_JSON解析エラー: {e}")
+    
+    all_vehicles = []
+    classifier = VehicleClassifier()
+    
+    # 各設定でスクレイピング
+    for config in MONITORING_CONFIGS:
+        print(f"\n[処理中] {config['name']}")
+        
+        site = config["site"]
+        if site == "carsensor":
+            parser = parse_carsensor_list_enhanced
+        elif site == "goonet":
+            parser = parse_goonet_list_enhanced
+        else:
             print(f"[SKIP] 未対応サイト: {site}")
             continue
-
-        collected: List[Dict[str, Any]] = []
-        for page in range(1, pages + 1):
-            u = url + (f"&page={page}" if page > 1 else "")
-            try:
-                print(f"[GET] {u}")
-                html = fetch(u)
-                items = parser(html)
-                # SUVのみ + ハスラー除外（表記ゆれ吸収）
-                items = keyword_filter(
-                    items,
-                    include_keywords=cfg.get("include_keywords"),
-                    exclude_keywords=cfg.get("exclude_keywords")
-                )
-                collected.extend(items)
-            except requests.HTTPError as e:
-                code = getattr(e.response, "status_code", "?")
-                print(f"[HTTP {code}] {u}")
-            except Exception as e:
-                print(f"[ERR] {u}: {e}")
-
-        # 分位回帰 OOF 予測（十分な件数がある回だけ有効）
-        qpreds = oof_quantile_preds(collected, alphas=(0.5, 0.2))
-        for i, it in enumerate(collected):
-            it["pred_p50"] = qpreds.get(0.5, [None]*len(collected))[i] if collected else None
-            it["pred_p20"] = qpreds.get(0.2, [None]*len(collected))[i] if collected else None
-
-        # 中央値相場 → 評価
-        stats = compute_price_stats(collected)
-        for it in collected:
-            assess_deal(it, stats, cfg)
-
-        all_items.extend(collected)  # カテゴリ分割用に全件を保持
-
-        # L4+を優先、足りなければスコア上位で補完（CSV用トップ候補）
-        picks = [x for x in collected if x.get("urgency", 1) >= 4]
-        if len(picks) < 8:
-            extra = sorted([x for x in collected if x not in picks],
-                           key=lambda x: x.get("score", 0), reverse=True)
-            picks.extend(extra[:8 - len(picks)])
-
-        print(f"  → 候補 {len(picks)} 件（{cfg.get('name')}）")
-        all_picks.extend(picks)
-
-    # 全体から上位10をCSVに出力（従来互換）
-    all_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
-    top = all_picks[:10]
-
-    out_csv = "results.csv"
-    with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["title","url","site","year","mileage","price",
-                    "score","price_ratio","urgency","pred_p50","pred_p20","deal_gap"])
-        for it in top:
-            p50 = it.get("pred_p50"); p20 = it.get("pred_p20")
-            w.writerow([
-                it.get("title", ""), it.get("url", ""), it.get("site", ""),
-                it.get("year", 0), it.get("mileage", 0), it.get("price", 0),
-                it.get("score", 0), it.get("price_ratio", "-"), it.get("urgency", 1),
-                int(p50) if isinstance(p50, (int,float)) else "",
-                int(p20) if isinstance(p20, (int,float)) else "",
-                it.get("deal_gap","")
+        
+        vehicles = []
+        
+        for page in range(1, config.get("pages", 1) + 1):
+            # URL構築
+            url = config["base_url"]
+            if config.get("params"):
+                param_str = "&".join([f"{k}={v}" for k, v in config["params"].items()])
+                url += ("&" if "?" in url else "?") + param_str
+            if page > 1:
+                url += f"&page={page}"
+            
+            print(f"  取得中: {url}")
+            html = fetch_with_retry(url)
+            if not html:
+                continue
+            
+            # パース
+            items = parser(html)
+            print(f"  → {len(items)}件取得")
+            
+            # フィルタリング
+            filtered = []
+            for item in items:
+                # 価格・年式・走行距離フィルタ
+                if item.get("price", 0) > config.get("price_max", 9999999):
+                    continue
+                if item.get("year", 0) < config.get("year_min", 0):
+                    continue
+                if item.get("mileage", 0) > config.get("mileage_max", 9999999):
+                    continue
+                
+                # SUV確認（詳細チェック）
+                if item.get("confidence", 0) < 0.5:
+                    # 信頼度が低い場合は詳細ページを確認
+                    details = extract_vehicle_details(item["url"], site)
+                    if details:
+                        detailed_text = details.get("description", "") + " " + details.get("body_type", "")
+                        is_suv, model, conf = classifier.classify(item["title"], detailed_text)
+                        
+                        if is_suv and conf >= 0.5:
+                            item["model_name"] = model
+                            item["confidence"] = conf
+                            item.update(details)
+                        else:
+                            continue  # SUVでない
+                
+                filtered.append(item)
+            
+            vehicles.extend(filtered)
+            print(f"  → フィルタ後: {len(filtered)}件")
+        
+        if not vehicles:
+            print(f"  → 該当車両なし")
+            continue
+        
+        # 市場統計計算
+        prices = [v["price"] for v in vehicles if v.get("price", 0) > 0]
+        if len(prices) >= 5:
+            market_stats = {
+                "median": np.median(prices),
+                "q25": np.percentile(prices, 25),
+                "q75": np.percentile(prices, 75),
+                "mean": np.mean(prices),
+                "std": np.std(prices)
+            }
+            print(f"  市場統計: 中央値 {market_stats['median']:,.0f}円")
+        else:
+            market_stats = {}
+        
+        # 予測価格計算
+        if len(vehicles) >= 20:
+            predictions = predict_quantiles(vehicles)
+            for i, vehicle in enumerate(vehicles):
+                vehicle["pred_p50"] = predictions[0.5][i] if not np.isnan(predictions[0.5][i]) else None
+                vehicle["pred_p20"] = predictions[0.2][i] if not np.isnan(predictions[0.2][i]) else None
+        
+        # スコア計算
+        for vehicle in vehicles:
+            compute_enhanced_score(vehicle, market_stats, config)
+        
+        all_vehicles.extend(vehicles)
+    
+    # 全体でソート
+    all_vehicles.sort(key=lambda x: (x.get("urgency", 0), x.get("score", 0)), reverse=True)
+    
+    # CSV出力
+    print("\n[CSV出力]")
+    with open("suv_results.csv", "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "タイトル", "URL", "サイト", "モデル", "信頼度",
+            "価格", "年式", "走行距離", "スコア", "緊急度",
+            "相場比", "予測差額", "グレード"
+        ])
+        
+        for v in all_vehicles[:30]:
+            writer.writerow([
+                v.get("title", ""),
+                v.get("url", ""),
+                v.get("site", ""),
+                v.get("model_name", ""),
+                f"{v.get('confidence', 0):.0%}",
+                v.get("price", 0),
+                v.get("year", 0),
+                v.get("mileage", 0),
+                v.get("score", 0),
+                v.get("urgency", 0),
+                f"{v.get('price_ratio', 0):.0%}" if v.get("price_ratio") else "",
+                v.get("deal_gap", ""),
+                v.get("grade", "")
             ])
-    print(f"[OK] CSV 出力: {out_csv}（{len(top)}件）")
-
-    # 二段階通知
-    immediate, maybe = split_candidates(all_items)
-    _post_discord(immediate, WEBHOOK_MAIN,  "🚀 即買いレベル")
-    _post_discord(maybe,    WEBHOOK_MAYBE, "🤔 ありかもレベル")
-
-    # 後方互換の単一通知をどうしても使いたい場合は以下を有効化
-    # discord_notify(top)
+    print(f"  → suv_results.csv に上位30件を保存")
+    
+    # Discord通知準備
+    immediate_items = [v for v in all_vehicles if v.get("urgency", 0) >= immediate_min]
+    maybe_items = [v for v in all_vehicles 
+                   if v.get("urgency", 0) == 3 or 
+                   (maybe_score_min <= v.get("score", 0) <= maybe_score_max)]
+    
+    # 重複除去
+    immediate_urls = {v["url"] for v in immediate_items}
+    maybe_items = [v for v in maybe_items if v["url"] not in immediate_urls]
+    
+    # 通知送信
+    print("\n[Discord通知]")
+    send_discord_notification(immediate_items[:5], webhook_main, "🚀 即買いレベル SUV")
+    send_discord_notification(maybe_items[:5], webhook_maybe, "🤔 検討価値あり SUV")
+    
+    print("\n[完了]")
+    print(f"  即買い候補: {len(immediate_items)}件")
+    print(f"  検討候補: {len(maybe_items)}件")
+    print(f"  総取得数: {len(all_vehicles)}件")
 
 if __name__ == "__main__":
     main()
