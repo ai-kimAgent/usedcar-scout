@@ -59,9 +59,9 @@ DEFAULT_TARGETS = [
         "name": "テスト: 北海道SUV 2013年〜 7万km以下 〜120万円",
         "site": "carsensor",
         "url": "https://www.carsensor.net/usedcar/search.php?STID=CS210610&YMIN=2013&AR=4&SMAX=70000&PMAX=1200000&SP=D&NOTKEI=1&BT=X",
-        "pages": 2,
+        "pages": 20,
         "price_max": 1200000,
-        "year_min": 2013,
+        "year_min": 2010,
         "mileage_max": 70000,
         "include_keywords": [],  # URL側で条件指定しているので空でOK
         "exclude_keywords": []
