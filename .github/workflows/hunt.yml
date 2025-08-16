@@ -26,12 +26,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Syntax check
+        run: python -m py_compile src/hunt.py
+
       - name: Run hunt
         env:
-            DISCORD_WEBHOOK_URL_MAIN: ${{ secrets.DISCORD_WEBHOOK_URL_MAIN }}
-            DISCORD_WEBHOOK_URL_MAYBE: ${{ secrets.DISCORD_WEBHOOK_URL_MAYBE }}
-          # 任意: 監視対象の上書き（JSON文字列）— 例をSecretsに入れて有効化してください
+          # 即買いレベル用（必須推奨）
+          DISCORD_WEBHOOK_URL_MAIN:  ${{ secrets.DISCORD_WEBHOOK_URL_MAIN }}
+          # ありかもレベル用（任意）
+          DISCORD_WEBHOOK_URL_MAYBE: ${{ secrets.DISCORD_WEBHOOK_URL_MAYBE }}
+          # 旧単一Webhook名の互換フォールバック（任意）
+          DISCORD_WEBHOOK_URL:       ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+          # 監視条件の上書き（任意：JSON文字列）
           # TARGETS_JSON: ${{ secrets.TARGETS_JSON }}
+
+          # テスト時は1でコンソール出力のみ（通知なし）
+          # DISCORD_DRY_RUN: "1"
+
+          # しきい値微調整（任意）
+          # IMMEDIATE_URGENCY_MIN: "4"
+          # MAYBE_SCORE_MIN: "70"
+          # MAYBE_SCORE_MAX: "84.9"
         run: |
           python src/hunt.py
 
